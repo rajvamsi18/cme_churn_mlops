@@ -2,7 +2,6 @@
 
 import mlflow
 import mlflow.sklearn
-import mlflow.lightgbm
 import pandas as pd
 import numpy as np
 import shap
@@ -20,20 +19,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── App initialisation ─────────────────────────────────────
+# ── App ────────────────────────────────────────────────────
 app = FastAPI(
     title="CME Churn Prediction API",
     description="""
-    Predicts probability of customer churn for CME Group clients.
-    Returns churn probability score, risk tier, and top driving factors.
+    Predicts churn probability for CME Group clients.
+    Returns probability score, risk tier, and top driving factors.
     Used by relationship managers to prioritise proactive outreach.
     """,
     version="1.0.0"
 )
 
 # ── Global model state ─────────────────────────────────────
-# Model is loaded once at startup and reused for every request.
-# Loading from MLflow registry every request would be 100x slower.
+# Loaded once at startup, reused for every request.
+# Loading from registry on every request would add 1-3s latency.
 model = None
 feature_columns = None
 
@@ -41,38 +40,27 @@ feature_columns = None
 # ── Input Schema ───────────────────────────────────────────
 class CustomerFeatures(BaseModel):
     """
-    Input validation schema using Pydantic.
-    
-    Every field has a type, range constraint, and description.
-    If a caller sends CreditScore=99999 or Age=-5, FastAPI
-    rejects the request immediately with a clear error message
-    before it ever reaches the model.
-    
+    Input validation via Pydantic.
+
+    Every field has type and range constraints.
+    Malformed requests are rejected before reaching the model.
+    In a regulated environment like CME, silent bad inputs
+    producing bad outputs is unacceptable — fail fast, loudly.
     """
-    CreditScore:      int   = Field(..., ge=300, le=900,
-                                    description="Customer credit score")
-    Age:              int   = Field(..., ge=18,  le=100,
-                                    description="Customer age in years")
-    Tenure:           int   = Field(..., ge=0,   le=10,
-                                    description="Years as customer")
-    Balance:          float = Field(..., ge=0,
-                                    description="Account balance")
-    NumOfProducts:    int   = Field(..., ge=1,   le=4,
-                                    description="Number of products held")
-    HasCrCard:        int   = Field(..., ge=0,   le=1,
-                                    description="Has credit card: 1=yes 0=no")
-    IsActiveMember:   int   = Field(..., ge=0,   le=1,
-                                    description="Is active member: 1=yes 0=no")
-    EstimatedSalary:  float = Field(..., ge=0,
-                                    description="Estimated annual salary")
-    Geography_France: int   = Field(..., ge=0,   le=1)
-    Geography_Germany:int   = Field(..., ge=0,   le=1)
-    Geography_Spain:  int   = Field(..., ge=0,   le=1)
-    Gender:           int   = Field(..., ge=0,   le=1,
-                                    description="Gender: 1=Male 0=Female")
+    CreditScore:       int   = Field(..., ge=300, le=900)
+    Age:               int   = Field(..., ge=18,  le=100)
+    Tenure:            int   = Field(..., ge=0,   le=10)
+    Balance:           float = Field(..., ge=0)
+    NumOfProducts:     int   = Field(..., ge=1,   le=4)
+    HasCrCard:         int   = Field(..., ge=0,   le=1)
+    IsActiveMember:    int   = Field(..., ge=0,   le=1)
+    EstimatedSalary:   float = Field(..., ge=0)
+    Geography_France:  int   = Field(..., ge=0,   le=1)
+    Geography_Germany: int   = Field(..., ge=0,   le=1)
+    Geography_Spain:   int   = Field(..., ge=0,   le=1)
+    Gender:            int   = Field(..., ge=0,   le=1)
 
     class Config:
-        # Example payload shown in the API docs at /docs
         json_schema_extra = {
             "example": {
                 "CreditScore": 650,
@@ -94,35 +82,32 @@ class CustomerFeatures(BaseModel):
 # ── Response Schema ────────────────────────────────────────
 class ChurnPrediction(BaseModel):
     """
-    Structured response for every field is documented and typed.
-    
-    Returning SHAP reasons not just a score, because
-    A relationship manager calling this API doesn't need 0.73.
-    They need: "this client is high risk primarily because
-    they have only 1 product and are not an active member."
-    That's an actionable insight they can use in a conversation.
+    Structured response — typed and documented.
+
+    Returns SHAP-driven reasons not just a score because
+    a relationship manager needs to know WHY a client is
+    at risk — not just that they are. Actionable insight
+    enables a relevant conversation, not a generic call.
     """
     churn_probability: float
-    risk_tier:         str    # HIGH / MEDIUM / LOW
-    top_reasons:       list   # top 3 SHAP-driven factors
+    risk_tier:         str
+    top_reasons:       list
     model_version:     str
 
 
-# ── Helper Functions ───────────────────────────────────────
+# ── Feature Engineering ────────────────────────────────────
 def engineer_features_for_input(data: dict) -> pd.DataFrame:
     """
-    Applied the same feature engineering from preprocess.py
-    to a single incoming request.
-    
-    Critical point: the model was trained on engineered features.
-    If you send raw features at inference time, the model gets
-    different inputs than it was trained on and predictions
-    will be wrong. Training and inference MUST apply identical
-    transformations.
+    Apply identical feature engineering as preprocess.py.
+
+    Critical: model was trained on engineered features.
+    If raw features are sent at inference the model receives
+    different inputs than it trained on — predictions will be wrong.
+    Training and inference MUST apply identical transformations.
+    This is one of the most common production ML bugs.
     """
     df = pd.DataFrame([data])
-    
-    # Same transformations as preprocess.py
+
     df['Balance_to_Salary_ratio'] = (
         df['Balance'] / (df['EstimatedSalary'] + 1e-9)
     )
@@ -138,18 +123,18 @@ def engineer_features_for_input(data: dict) -> pd.DataFrame:
     df['Engagement_Score'] = (
         df['IsActiveMember'] + df['NumOfProducts']
     )
-    
+
     return df
 
 
 def get_risk_tier(probability: float) -> str:
     """
-    Converted probability score to business-readable risk tier.
-    
-    Thresholds match the F-beta analysis from training:
-    > 0.6 = HIGH  — immediate outreach required
-    > 0.35 = MEDIUM — monitor closely, soft outreach
-    <= 0.35 = LOW  — standard engagement
+    Convert probability to business-readable risk tier.
+
+    Thresholds calibrated to the F-beta analysis from training:
+    HIGH   > 0.60 — immediate outreach required
+    MEDIUM > 0.35 — monitor closely, soft outreach
+    LOW   <= 0.35 — standard engagement cadence
     """
     if probability >= 0.6:
         return "HIGH"
@@ -159,116 +144,112 @@ def get_risk_tier(probability: float) -> str:
         return "LOW"
 
 
-def get_shap_reasons(model, feature_df: pd.DataFrame) -> list:
+def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
     """
-    Generated top 3 human-readable reasons for the prediction.
-    
-    SHAP assigns each feature a contribution value to this
-    specific prediction. Positive = pushes towards churn.
-    Negative = pushes away from churn.
-    
-    I took the top 3 positive contributors and convert them
-    to plain English reasons the relationship manager can use.
+    Generate top 3 human-readable reasons using SHAP values.
+
+    SHAP assigns each feature a contribution to this specific
+    prediction. Positive = pushes towards churn.
+    We surface the top 3 positive contributors as plain English
+    reasons the relationship manager can use in conversation.
     """
     try:
-        # Get the underlying model if wrapped in sklearn Pipeline
-        underlying_model = (
-            model.named_steps['model']
-            if hasattr(model, 'named_steps')
-            else model
+        underlying = (
+            model_obj.named_steps['model']
+            if hasattr(model_obj, 'named_steps')
+            else model_obj
         )
-        
-        explainer = shap.TreeExplainer(underlying_model)
-        
-        # Get features the model actually used
-        if hasattr(model, 'named_steps'):
-            # Pipeline — transform features first
-            features_transformed = model.named_steps[
+
+        explainer = shap.TreeExplainer(underlying)
+
+        if hasattr(model_obj, 'named_steps'):
+            features_scaled = model_obj.named_steps[
                 'scaler'
             ].transform(feature_df)
-            shap_values = explainer.shap_values(features_transformed)
+            shap_values = explainer.shap_values(features_scaled)
         else:
             shap_values = explainer.shap_values(feature_df)
-        
-        # For binary classification, shap_values may be
-        # a list [class0_values, class1_values]
-        # We want class 1 (churn) values
+
         if isinstance(shap_values, list):
             shap_vals = shap_values[1][0]
         else:
             shap_vals = shap_values[0]
-        
-        # Map SHAP values back to feature names
+
         feature_names = feature_df.columns.tolist()
         shap_dict = dict(zip(feature_names, shap_vals))
-        
-        # Sort by absolute contribution, take top 3 positive
+
         sorted_features = sorted(
             shap_dict.items(),
             key=lambda x: x[1],
             reverse=True
         )[:3]
-        
-        # Convert to human readable
+
         readable_map = {
-            'IsActiveMember':         'Customer is not an active member',
-            'Age':                    'Customer age is a risk factor',
-            'NumOfProducts':          'Low number of products held',
-            'Balance':                'Account balance pattern',
-            'Balance_to_Salary_ratio':'Balance relative to salary is unusual',
-            'Engagement_Score':       'Low overall engagement score',
-            'Is_Zero_Balance':        'Account has zero balance (dormant)',
-            'Products_per_Year':      'Low product adoption rate',
-            'CreditScore':            'Credit score is a contributing factor',
-            'Tenure':                 'Customer tenure is a risk factor',
-            'Age_Group':              'Age group shows elevated churn risk',
-            'Geography_Germany':      'Geography is a contributing factor',
-            'Geography_France':       'Geography is a contributing factor',
-            'Geography_Spain':        'Geography is a contributing factor',
-            'Gender':                 'Demographic profile factor',
-            'HasCrCard':              'Credit card holding status',
-            'EstimatedSalary':        'Salary profile is a factor',
+            'IsActiveMember':          'Customer is not an active member',
+            'Age':                     'Customer age is a risk factor',
+            'NumOfProducts':           'Low number of products held',
+            'Balance':                 'Account balance pattern is unusual',
+            'Balance_to_Salary_ratio': 'Balance relative to salary is a risk signal',
+            'Engagement_Score':        'Low overall engagement score',
+            'Is_Zero_Balance':         'Account has zero balance — dormant signal',
+            'Products_per_Year':       'Low product adoption rate over tenure',
+            'CreditScore':             'Credit score is a contributing factor',
+            'Tenure':                  'Customer tenure pattern',
+            'Age_Group':               'Age group shows elevated churn risk',
+            'Geography_Germany':       'Geography is a contributing factor',
+            'Geography_France':        'Geography is a contributing factor',
+            'Geography_Spain':         'Geography is a contributing factor',
+            'Gender':                  'Demographic profile factor',
+            'HasCrCard':               'Credit card holding status',
+            'EstimatedSalary':         'Salary profile is a factor',
         }
-        
+
         reasons = [
             readable_map.get(feat, feat)
             for feat, val in sorted_features
-            if val > 0  # only positive contributors
+            if val > 0
         ]
-        
-        return reasons if reasons else ["Combination of risk factors"]
-        
+
+        return reasons if reasons else ["Risk driven by combination of factors"]
+
     except Exception as e:
         logger.warning(f"SHAP explanation failed: {e}")
         return ["Risk score based on behavioural profile"]
 
 
-# ── Startup Event ──────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────
 @app.on_event("startup")
 async def load_model():
-    """
-    Loaded model from MLflow registry when API starts.
-    
-    Loading a model takes 1-3 seconds. If you loaded it
-    on every request, your API would have 1-3 second latency
-    on every single call. Load once at startup, reuse forever.
-    
-    In Kubernetes, if this startup fails the pod fails its
-    readiness probe and never receives traffic — which is
-    exactly the right behaviour. Don't serve traffic with
-    a broken model.
-    """
     global model, feature_columns
-    
+
     try:
-        model_name = "cme_churn_model"
-        model_uri  = f"models:/{model_name}/latest"
-        
-        logger.info(f"Loading model from MLflow registry: {model_uri}")
-        model = mlflow.sklearn.load_model(model_uri)
-        logger.info("Model loaded successfully")
-        
-        # These must match exactly what preprocess.py produces
+        import os
+        import joblib
+
+        # Determine base path based on environment
+        # Docker container: files copied to /app
+        # Local dev: files in project root
+        if os.path.exists('/app/mlruns'):
+            base_path = '/app'
+        else:
+            base_path = '.'
+
+        # Load directly from artifact file
+        # Bypasses MLflow registry path resolution which stores
+        # absolute Mac paths in mlflow.db — those paths don't
+        # exist inside the container.
+        # Production equivalent: Azure ML registry resolves
+        # this natively without any path issues.
+        model_path = (
+            f"{base_path}/mlruns/1/models/"
+            f"m-91451c74fbf942d992381ec5b9eda578/"
+            f"artifacts/model.pkl"
+        )
+
+        logger.info(f"Loading model from: {model_path}")
+        model = joblib.load(model_path)
+        logger.info(f"Model loaded successfully: {type(model).__name__}")
+
         feature_columns = [
             'CreditScore', 'Gender', 'Age', 'Tenure', 'Balance',
             'NumOfProducts', 'HasCrCard', 'IsActiveMember',
@@ -277,25 +258,21 @@ async def load_model():
             'Products_per_Year', 'Is_Zero_Balance',
             'Age_Group', 'Engagement_Score'
         ]
-        
+
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
-        # Don't raise here — let health check report unhealthy
-        # rather than crashing the process entirely
 
 
 # ── Endpoints ──────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
     """
-    Kubernetes liveness and readiness probe endpoint.
-    
-    Kubernetes calls this every 10 seconds to check if the
-    pod is alive. If this returns anything other than 200,
-    Kubernetes restarts the pod or stops sending it traffic.
-    
-    I also checked if model is loaded, a pod with no model
-    should not receive prediction requests.
+    Kubernetes liveness and readiness probe.
+
+    Called every 10 seconds by Kubernetes.
+    Returns 503 if model not loaded — pod gets no traffic
+    until model is ready. Correct behaviour — never serve
+    predictions from a pod with no model.
     """
     if model is None:
         raise HTTPException(
@@ -303,9 +280,9 @@ async def health_check():
             detail="Model not loaded — service unavailable"
         )
     return {
-        "status":        "healthy",
-        "model_loaded":  True,
-        "service":       "cme-churn-prediction"
+        "status":       "healthy",
+        "model_loaded": True,
+        "service":      "cme-churn-prediction"
     }
 
 
@@ -313,54 +290,55 @@ async def health_check():
 async def predict_churn(customer: CustomerFeatures):
     """
     Main prediction endpoint.
-    
-    Accepts customer features, returns churn probability,
-    risk tier, and top 3 reasons driving the prediction.
-    
-    Called by: CRM systems, relationship manager dashboards,
-    automated monitoring pipelines.
+
+    Accepts customer features, returns:
+    - churn_probability: float between 0 and 1
+    - risk_tier: HIGH / MEDIUM / LOW
+    - top_reasons: top 3 SHAP-driven risk factors
+    - model_version: which model version produced this prediction
+
+    Called by CRM systems, relationship manager dashboards,
+    and automated monitoring pipelines.
     """
     if model is None:
         raise HTTPException(
             status_code=503,
             detail="Model not loaded"
         )
-    
+
     try:
-        # Step 1 — Convert input to dict
+        # Convert input to dict
         input_data = customer.model_dump()
-        
-        # Step 2 — Apply feature engineering
-        # Must match training transformations exactly
+
+        # Apply feature engineering — must match training
         feature_df = engineer_features_for_input(input_data)
-        
-        # Step 3 — Reorder columns to match training order
+
+        # Reorder columns to match exact training order
         feature_df = feature_df[feature_columns]
-        
-        # Step 4 — Predict
+
+        # Predict
         churn_prob = float(
             model.predict_proba(feature_df)[0][1]
         )
-        
-        # Step 5 — Risk tier
+
+        # Risk tier
         risk_tier = get_risk_tier(churn_prob)
-        
-        # Step 6 — SHAP reasons
+
+        # SHAP reasons
         reasons = get_shap_reasons(model, feature_df)
-        
+
         logger.info(
             f"Prediction: prob={churn_prob:.3f} "
-            f"tier={risk_tier} "
-            f"reasons={reasons}"
+            f"tier={risk_tier}"
         )
-        
+
         return ChurnPrediction(
             churn_probability=round(churn_prob, 4),
             risk_tier=risk_tier,
             top_reasons=reasons,
             model_version="cme_churn_model_v1"
         )
-    
+
     except Exception as e:
         logger.error(f"Prediction failed: {e}")
         raise HTTPException(
@@ -372,8 +350,8 @@ async def predict_churn(customer: CustomerFeatures):
 @app.get("/")
 async def root():
     return {
-        "service": "CME Churn Prediction API",
-        "version": "1.0.0",
+        "service":   "CME Churn Prediction API",
+        "version":   "1.0.0",
         "endpoints": {
             "health":  "GET  /health",
             "predict": "POST /predict",
