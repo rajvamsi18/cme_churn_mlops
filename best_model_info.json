@@ -1,0 +1,11 @@
+{
+  "registered_name": "cme_churn_model",
+  "registered_version": 2,
+  "model_type": "RandomForest",
+  "run_id": "866631a948974722a7ce5220a2c8b9f3",
+  "auc_roc": 0.8548,
+  "auc_pr": 0.6522,
+  "recall": 0.8282,
+  "recall_top_decile": 0.3872,
+  "pkl_path": "mlruns/1/models/m-91451c74fbf942d992381ec5b9eda578/artifacts/model.pkl"
+}

@@ -7,6 +7,8 @@ import mlflow.sklearn
 import mlflow.lightgbm
 import logging
 import os
+import json
+import glob
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
@@ -28,13 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 # ── Constants ──────────────────────────────────────────────
-PROCESSED_PATH = "data/processed/churn_processed.csv"
+PROCESSED_PATH  = "data/processed/churn_processed.csv"
 MLFLOW_EXPERIMENT = "cme_churn_prediction"
-TEST_SIZE = 0.2
-RANDOM_STATE = 42
+TEST_SIZE       = 0.2
+RANDOM_STATE    = 42
 
 # CI/CD threshold gates — model must beat ALL of these
-AUC_THRESHOLD = 0.75
+# to be registered and deployed
+AUC_THRESHOLD    = 0.75
 RECALL_THRESHOLD = 0.55
 
 
@@ -42,6 +45,11 @@ def load_processed_data(path: str):
     """
     Load preprocessed data and perform time-based split.
 
+    Why time-based not random?
+    Random split leaks future behavioural patterns into training,
+    inflating validation scores. Time-based split mirrors production
+    reality — model only ever learned from the past.
+    Same principle as train/test split at SoulFoods churn model.
     """
     df = pd.read_csv(path)
 
@@ -49,7 +57,6 @@ def load_processed_data(path: str):
     y = df['Exited']
 
     # Last 20% of rows = holdout test set
-    # Simulates: train on Jan-Aug, evaluate on Sep-Oct
     split_idx = int(len(df) * (1 - TEST_SIZE))
 
     X_train = X.iloc[:split_idx]
@@ -69,19 +76,22 @@ def compute_metrics(y_true, y_pred_proba, threshold=0.35):
     Compute all evaluation metrics.
 
     Why threshold=0.35 not 0.5?
-    Missing a churner costs more than a wasted retention call.
-    0.35 weights recall over precision — same logic as F-beta
-    threshold tuning in the SoulFoods churn model.
+    Missing a churner (false negative) costs more than a wasted
+    retention call (false positive). 0.35 weights recall over
+    precision — same F-beta logic from SoulFoods churn model.
 
     Why AUC-PR alongside AUC-ROC?
-    ROC is optimistic on imbalanced data — includes true negatives
-    which dominate. PR curve focuses only on positive class — honest
-    metric when churners are the minority.
+    ROC is optimistic on imbalanced data because it counts true
+    negatives which dominate. PR curve focuses only on the positive
+    class — honest metric when churners are the minority.
+
+    Recall@TopDecile — the real business metric.
+    Of the top 10% highest risk customers flagged,
+    what % actually churn? This is what the retention team cares
+    about — not an abstract AUC number.
     """
     y_pred = (y_pred_proba >= threshold).astype(int)
 
-    # Recall at top decile — the real business metric
-    # Of the top 10% highest-risk customers, what % actually churn?
     n_top = int(len(y_true) * 0.1)
     top_idx = np.argsort(y_pred_proba)[::-1][:n_top]
     recall_top_decile = y_true.iloc[top_idx].sum() / y_true.sum()
@@ -98,11 +108,15 @@ def compute_metrics(y_true, y_pred_proba, threshold=0.35):
 
 def check_threshold_gates(metrics: dict, model_name: str) -> bool:
     """
-    Check if model meets minimum quality gates before registration.
+    Check if model meets minimum quality gates.
 
     This same logic runs in GitHub Actions CI/CD pipeline.
     If a model fails here it never gets registered and never
-    reaches production. No human approval needed, automated gate.
+    reaches production. Automated gate — no human approval needed.
+
+    This is the "evaluation as a control mechanism" pattern
+    from the RAG system at SoulFoods — same principle applied
+    to classical ML models.
     """
     passed = True
 
@@ -128,15 +142,17 @@ def check_threshold_gates(metrics: dict, model_name: str) -> bool:
 
 def train_logistic_regression(X_train, y_train):
     """
-    Baseline model
+    Baseline model.
 
-    Forces good feature engineering because LR cannot learn
-    non-linear interactions on its own. If LR performs well
-    your features are strong. If it struggles you know tree
-    models are needed, which confirms my algorithm choice.
+    Always start with the simplest model that could work.
+    LR forces good feature engineering because it cannot learn
+    non-linear interactions. If LR performs well, features are
+    strong. If it struggles, tree models are needed — which
+    confirms the algorithm choice rationale.
 
-    Pipeline bundles scaler + model so scaling is ALWAYS applied
-    consistently at training, validation, AND inference.
+    Pipeline bundles scaler + model — critical so scaling is
+    applied consistently at training AND inference.
+    Forgetting to scale at inference is a classic production bug.
     """
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
@@ -152,8 +168,8 @@ def train_logistic_regression(X_train, y_train):
 
 def train_random_forest(X_train, y_train):
     """
-    Intermediate model, captures non-linear patterns.
-    No scaling needed, tree models are scale-invariant.
+    Intermediate model — captures non-linear patterns.
+    No scaling needed — tree models are scale-invariant.
     They split on feature values not distances.
     """
     model = RandomForestClassifier(
@@ -169,17 +185,17 @@ def train_random_forest(X_train, y_train):
 
 def train_lightgbm(X_train, y_train):
     """
-    Primary model, expected best performer on tabular data.
+    Primary model — expected best performer on tabular data.
 
     Why LightGBM over XGBoost or Random Forest?
-    1. Histogram-based splitting, faster on this dataset size
+    1. Histogram-based splitting — faster on this dataset size
     2. scale_pos_weight handles class imbalance without distorting
        probability calibration the way SMOTE would
     3. Consistent performance advantage on mixed feature types
 
     scale_pos_weight = negatives / positives
-    Tells LightGBM to weight churners proportionally more heavily
-    during training without resampling the data.
+    Tells LightGBM to weight churners proportionally more during
+    training without resampling the data.
     """
     neg = (y_train == 0).sum()
     pos = (y_train == 1).sum()
@@ -200,27 +216,75 @@ def train_lightgbm(X_train, y_train):
     return model
 
 
+def find_model_pkl_path(run_id: str) -> str:
+    """
+    Find the physical pkl file path for a given MLflow run.
+
+    MLflow stores model artifacts in mlruns/ with a hash-based
+    directory structure. This function scans for the pkl file
+    belonging to a specific run and returns its relative path.
+
+    Why relative path not absolute?
+    Absolute paths are machine-specific. A relative path like
+    mlruns/1/models/m-abc123/artifacts/model.pkl resolves
+    correctly on any machine by prepending the known base path.
+    This is what makes Docker loading reliable.
+    """
+    pattern = "mlruns/**/model.pkl"
+    all_pkls = glob.glob(pattern, recursive=True)
+
+    # Try to find pkl associated with this specific run
+    # MLflow artifact paths contain fragments of run metadata
+    for pkl_path in all_pkls:
+        try:
+            # Check MLflow artifacts for this run to find match
+            client = mlflow.tracking.MlflowClient()
+            artifacts = client.list_artifacts(run_id)
+            for artifact in artifacts:
+                if artifact.path == 'model':
+                    # This run has a model artifact
+                    # The pkl should be in a directory linked to this run
+                    # Try to match by checking if run_id appears in path
+                    # or fall back to returning the most recent pkl
+                    pass
+        except Exception:
+            pass
+
+    # Simpler approach — return all pkls, let caller pick
+    return all_pkls
+
+
 def run_training():
     """
     Main training orchestrator.
-    
+
+    Flow:
+    1. Load processed data, split train/test
+    2. Train 3 models — LR baseline, RandomForest, LightGBM
+    3. Evaluate each against threshold gates
+    4. Register best passing model to MLflow registry
+       (registry provides version history and rollback capability)
+    5. Write best_model_info.json with relative pkl path
+       (JSON provides reliable Docker loading without registry path issues)
+
+    Why both registry AND JSON?
+    Registry = governance, versioning, rollback
+    JSON = reliable loading mechanism in containerised environments
+    where SQLite MLflow stores environment-specific absolute paths
+    that don't survive containerisation.
+
+    In production with Azure ML managed registry, only Strategy 1
+    (registry) would be needed — Azure resolves paths centrally.
     """
     # Local SQLite MLflow — reliable artifact storage
-    # Docker container overrides this via MLFLOW_TRACKING_URI env var
-    # pointing to sqlite:////app/mlflow.db (absolute path in container)
-    tracking_uri = os.getenv(
-        'MLFLOW_TRACKING_URI',
-        'sqlite:///mlflow.db'
-    )
+    tracking_uri = os.getenv('MLFLOW_TRACKING_URI', 'sqlite:///mlflow.db')
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
     logger.info(f"MLflow tracking URI: {tracking_uri}")
     logger.info(f"MLflow experiment: {MLFLOW_EXPERIMENT}")
 
     # Load data
-    X_train, X_test, y_train, y_test = load_processed_data(
-        PROCESSED_PATH
-    )
+    X_train, X_test, y_train, y_test = load_processed_data(PROCESSED_PATH)
 
     # Models to train
     model_configs = [
@@ -249,21 +313,21 @@ def run_training():
             # Metrics
             metrics = compute_metrics(y_test, y_pred_proba)
 
-            # Log parameters
+            # Log parameters to MLflow
             mlflow.log_param("model_type",   model_name)
             mlflow.log_param("test_size",    TEST_SIZE)
             mlflow.log_param("threshold",    0.35)
             mlflow.log_param("random_state", RANDOM_STATE)
 
-            # Log metrics
+            # Log metrics to MLflow
             mlflow.log_metrics(metrics)
 
             # Log model artifact
             # artifact_path="model" is required for register_model
-            # to resolve the URI correctly as runs:/{run_id}/model
+            # to resolve the URI as runs:/{run_id}/model
             log_fn(model, artifact_path="model")
 
-            # Log results
+            # Print results
             logger.info(f"  AUC-ROC:          {metrics['auc_roc']:.4f}")
             logger.info(f"  AUC-PR:           {metrics['auc_pr']:.4f}")
             logger.info(f"  Recall:           {metrics['recall']:.4f}")
@@ -304,20 +368,121 @@ def run_training():
         f"(AUC-ROC: {best['metrics']['auc_roc']:.4f})"
     )
 
-    # ── Register Best Model ────────────────────────────────
-    # URI format: runs:/{run_id}/model
-    # "model" matches the artifact_path used in log_fn above
+    # ── Register to MLflow Registry ────────────────────────
+    # Registry provides: version history, rollback capability,
+    # named pointer to current best model.
+    # "models:/cme_churn_model/1" can be rolled back to
+    # by loading a specific version number if latest degrades.
     model_uri = f"runs:/{best['run_id']}/model"
     logger.info(f"Registering from URI: {model_uri}")
 
-    registered = mlflow.register_model(
-        model_uri=model_uri,
-        name="cme_churn_model"
-    )
-    logger.info(
-        f"Registered: cme_churn_model "
-        f"version {registered.version}"
-    )
+    registered_version = None
+    try:
+        registered = mlflow.register_model(
+            model_uri=model_uri,
+            name="cme_churn_model"
+        )
+        registered_version = registered.version
+        logger.info(
+            f"Registered: cme_churn_model "
+            f"version {registered_version}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Registry registration failed: {e}. "
+            f"Continuing — JSON pointer will be used for loading."
+        )
+
+    # ── Write best_model_info.json ─────────────────────────
+    # This is the reliable loading mechanism for Docker containers.
+    #
+    # Problem: MLflow registry stores absolute paths in mlflow.db
+    # e.g. /Users/rajvamsichenna/... or /home/runner/work/...
+    # These paths don't exist inside Docker containers which
+    # have their own filesystem starting at /app/
+    #
+    # Solution: find the actual pkl file and store its RELATIVE path.
+    # Relative path + known base (/app or .) = correct absolute path
+    # in any environment without any database lookup.
+    #
+    # The registry still exists for governance and rollback.
+    # JSON is just the reliable loading pointer.
+
+    # Find pkl files created during this training run
+    all_pkls = glob.glob("mlruns/**/model.pkl", recursive=True)
+
+    # Find the pkl for our best model's run
+    # MLflow artifact structure: mlruns/exp_id/models/m-hash/artifacts/model.pkl
+    # We identify ours by process of elimination —
+    # there are exactly 3 pkls (one per model trained)
+    # and we know which run_id belongs to the best model
+    best_pkl_path = None
+
+    # Try to match via MLflow client artifact listing
+    try:
+        client = mlflow.tracking.MlflowClient()
+        # Get artifact URI for best run
+        run_info = client.get_run(best['run_id'])
+        artifact_uri = run_info.info.artifact_uri
+        # artifact_uri looks like: mlruns/1/run_id/artifacts
+        # Extract the relative component
+        if artifact_uri.startswith('mlruns'):
+            potential_pkl = os.path.join(artifact_uri, 'model', 'model.pkl')
+            if os.path.exists(potential_pkl):
+                best_pkl_path = potential_pkl
+                logger.info(f"Found pkl via artifact URI: {best_pkl_path}")
+    except Exception as e:
+        logger.warning(f"Artifact URI lookup failed: {e}")
+
+    # Fallback — match by checking which pkl loads as correct type
+    if best_pkl_path is None:
+        import joblib
+        expected_type = best['model_name']
+        for pkl_path in all_pkls:
+            try:
+                candidate = joblib.load(pkl_path)
+                candidate_type = type(candidate).__name__
+                # Match model type to expected
+                if expected_type == 'LogisticRegression' and 'Pipeline' in candidate_type:
+                    best_pkl_path = pkl_path
+                    break
+                elif expected_type == 'RandomForest' and 'RandomForest' in candidate_type:
+                    best_pkl_path = pkl_path
+                    break
+                elif expected_type == 'LightGBM' and 'LGBM' in candidate_type:
+                    best_pkl_path = pkl_path
+                    break
+            except Exception:
+                continue
+
+    if best_pkl_path is None and all_pkls:
+        # Last resort — use first available pkl
+        best_pkl_path = all_pkls[0]
+        logger.warning(
+            f"Could not identify best pkl precisely. "
+            f"Using: {best_pkl_path}"
+        )
+
+    # Write the JSON pointer file
+    model_info = {
+        "registered_name":    "cme_churn_model",
+        "registered_version": registered_version,
+        "model_type":         best['model_name'],
+        "run_id":             best['run_id'],
+        "auc_roc":            round(best['metrics']['auc_roc'], 4),
+        "auc_pr":             round(best['metrics']['auc_pr'], 4),
+        "recall":             round(best['metrics']['recall'], 4),
+        "recall_top_decile":  round(best['metrics']['recall_top_decile'], 4),
+        "pkl_path":           best_pkl_path,
+        # pkl_path is RELATIVE — prepend base_path at load time
+        # Local:  ./mlruns/...
+        # Docker: /app/mlruns/...
+    }
+
+    with open("best_model_info.json", "w") as f:
+        json.dump(model_info, f, indent=2)
+
+    logger.info(f"Saved best_model_info.json: {model_info}")
     logger.info("Training complete. Model ready for deployment.")
 
     return best

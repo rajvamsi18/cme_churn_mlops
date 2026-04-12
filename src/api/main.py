@@ -7,9 +7,9 @@ import numpy as np
 import shap
 import logging
 import os
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -18,6 +18,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
 
 # ── App ────────────────────────────────────────────────────
 app = FastAPI(
@@ -32,7 +33,7 @@ app = FastAPI(
 
 # ── Global model state ─────────────────────────────────────
 # Loaded once at startup, reused for every request.
-# Loading from registry on every request would add 1-3s latency.
+# Loading from registry per request = 1-3s latency per call.
 model = None
 feature_columns = None
 
@@ -84,46 +85,38 @@ class ChurnPrediction(BaseModel):
     """
     Structured response — typed and documented.
 
-    Returns SHAP-driven reasons not just a score because
-    a relationship manager needs to know WHY a client is
-    at risk — not just that they are. Actionable insight
-    enables a relevant conversation, not a generic call.
+    Returns SHAP reasons not just a score because a relationship
+    manager needs to know WHY a client is at risk, not just that
+    they are. Actionable insight enables a relevant conversation.
     """
     churn_probability: float
     risk_tier:         str
     top_reasons:       list
     model_version:     str
+    model_type:        str
 
 
 # ── Feature Engineering ────────────────────────────────────
 def engineer_features_for_input(data: dict) -> pd.DataFrame:
     """
-    Apply identical feature engineering as preprocess.py.
+    Apply identical transformations as preprocess.py.
 
-    Critical: model was trained on engineered features.
-    If raw features are sent at inference the model receives
-    different inputs than it trained on — predictions will be wrong.
+    CRITICAL: model was trained on engineered features.
+    If raw features are sent at inference the model gets different
+    inputs than it trained on — predictions will be wrong.
     Training and inference MUST apply identical transformations.
     This is one of the most common production ML bugs.
     """
     df = pd.DataFrame([data])
-
-    df['Balance_to_Salary_ratio'] = (
-        df['Balance'] / (df['EstimatedSalary'] + 1e-9)
-    )
-    df['Products_per_Year'] = (
-        df['NumOfProducts'] / (df['Tenure'] + 1)
-    )
+    df['Balance_to_Salary_ratio'] = df['Balance'] / (df['EstimatedSalary'] + 1e-9)
+    df['Products_per_Year'] = df['NumOfProducts'] / (df['Tenure'] + 1)
     df['Is_Zero_Balance'] = (df['Balance'] == 0).astype(int)
     df['Age_Group'] = pd.cut(
         df['Age'],
         bins=[0, 30, 40, 50, 60, 100],
         labels=[0, 1, 2, 3, 4]
     ).astype(int)
-    df['Engagement_Score'] = (
-        df['IsActiveMember'] + df['NumOfProducts']
-    )
-
+    df['Engagement_Score'] = df['IsActiveMember'] + df['NumOfProducts']
     return df
 
 
@@ -131,10 +124,10 @@ def get_risk_tier(probability: float) -> str:
     """
     Convert probability to business-readable risk tier.
 
-    Thresholds calibrated to the F-beta analysis from training:
-    HIGH   > 0.60 — immediate outreach required
-    MEDIUM > 0.35 — monitor closely, soft outreach
-    LOW   <= 0.35 — standard engagement cadence
+    Thresholds calibrated to F-beta analysis from training:
+    HIGH   >= 0.60 — immediate outreach required
+    MEDIUM >= 0.35 — monitor closely, soft outreach
+    LOW    <  0.35 — standard engagement cadence
     """
     if probability >= 0.6:
         return "HIGH"
@@ -146,11 +139,11 @@ def get_risk_tier(probability: float) -> str:
 
 def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
     """
-    Generate top 3 human-readable reasons using SHAP values.
+    Generate top 3 human-readable SHAP-driven reasons.
 
     SHAP assigns each feature a contribution to this specific
     prediction. Positive = pushes towards churn.
-    We surface the top 3 positive contributors as plain English
+    We surface top 3 positive contributors as plain English
     reasons the relationship manager can use in conversation.
     """
     try:
@@ -159,13 +152,10 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
             if hasattr(model_obj, 'named_steps')
             else model_obj
         )
-
         explainer = shap.TreeExplainer(underlying)
 
         if hasattr(model_obj, 'named_steps'):
-            features_scaled = model_obj.named_steps[
-                'scaler'
-            ].transform(feature_df)
+            features_scaled = model_obj.named_steps['scaler'].transform(feature_df)
             shap_values = explainer.shap_values(features_scaled)
         else:
             shap_values = explainer.shap_values(feature_df)
@@ -177,11 +167,8 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
 
         feature_names = feature_df.columns.tolist()
         shap_dict = dict(zip(feature_names, shap_vals))
-
         sorted_features = sorted(
-            shap_dict.items(),
-            key=lambda x: x[1],
-            reverse=True
+            shap_dict.items(), key=lambda x: x[1], reverse=True
         )[:3]
 
         readable_map = {
@@ -189,7 +176,7 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
             'Age':                     'Customer age is a risk factor',
             'NumOfProducts':           'Low number of products held',
             'Balance':                 'Account balance pattern is unusual',
-            'Balance_to_Salary_ratio': 'Balance relative to salary is a risk signal',
+            'Balance_to_Salary_ratio': 'Balance to salary ratio is a risk signal',
             'Engagement_Score':        'Low overall engagement score',
             'Is_Zero_Balance':         'Account has zero balance — dormant signal',
             'Products_per_Year':       'Low product adoption rate over tenure',
@@ -209,7 +196,6 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
             for feat, val in sorted_features
             if val > 0
         ]
-
         return reasons if reasons else ["Risk driven by combination of factors"]
 
     except Exception as e:
@@ -220,47 +206,209 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
 # ── Startup ────────────────────────────────────────────────
 @app.on_event("startup")
 async def load_model():
+    """
+    Three-strategy model loading — tries each in order,
+    stops at first success.
+
+    ─────────────────────────────────────────────────────────
+    STRATEGY 1 — MLflow Registry
+    ─────────────────────────────────────────────────────────
+    Asks MLflow: "give me the latest version of cme_churn_model"
+    MLflow registry stores named versions — v1, v2, v3 etc.
+    This enables rollback: load version 2 if version 3 degrades.
+
+    Works when: Azure ML production (managed registry, HTTPS endpoint)
+    Fails when: Docker on Mac or CI (SQLite db stores machine-specific
+                absolute paths that don't exist inside container)
+
+    ─────────────────────────────────────────────────────────
+    STRATEGY 2 — best_model_info.json (primary Docker strategy)
+    ─────────────────────────────────────────────────────────
+    Training writes best_model_info.json with RELATIVE pkl path.
+    Example: {"pkl_path": "mlruns/1/models/m-abc/artifacts/model.pkl"}
+
+    At load time: base_path + relative_path = correct absolute path
+    Docker: /app + mlruns/1/... = /app/mlruns/1/...
+    Local:  .   + mlruns/1/... = ./mlruns/1/...
+
+    Why relative not absolute?
+    Absolute paths are machine-specific and break across environments.
+    Relative paths resolve correctly anywhere by prepending known base.
+    No database lookup, no path mismatch possible.
+
+    Registry still exists for governance/rollback — this is just
+    the reliable loading mechanism for containerised environments.
+
+    Works when: any Docker environment (Mac local, CI, production)
+    Fails when: best_model_info.json not present or pkl moved
+
+    ─────────────────────────────────────────────────────────
+    STRATEGY 3 — File Scan (safety net)
+    ─────────────────────────────────────────────────────────
+    Scans mlruns/ physically for all model.pkl files.
+    Loads the first one it finds — no registry, no JSON needed.
+
+    Works when: any environment where mlruns/ was copied in
+    Limitation: doesn't know which model is "best" without metrics
+                but better than returning 503 with no model at all
+
+    ─────────────────────────────────────────────────────────
+    In production with Azure ML:
+    Only Strategy 1 needed — Azure manages paths centrally
+    via HTTPS endpoints, not local filesystem paths.
+    ─────────────────────────────────────────────────────────
+    """
     global model, feature_columns
 
+    # Determine environment — Docker or local
+    if os.path.exists('/app/mlruns'):
+        base_path = '/app'
+        tracking_uri = "sqlite:////app/mlflow.db"
+    else:
+        base_path = '.'
+        tracking_uri = "sqlite:///mlflow.db"
+
+    logger.info(f"Environment base path: {base_path}")
+    logger.info(f"MLflow tracking URI: {tracking_uri}")
+
+    loaded_model = None
+    model_type_str = "unknown"
+
+    # ── Strategy 1: MLflow Registry ───────────────────────
     try:
-        import os
-        import joblib
+        mlflow.set_tracking_uri(tracking_uri)
+        model_uri = "models:/cme_churn_model/latest"
+        logger.info(f"Strategy 1: trying MLflow registry ({model_uri})")
+        loaded_model = mlflow.sklearn.load_model(model_uri)
+        model_type_str = type(loaded_model).__name__
+        logger.info(f"Strategy 1 SUCCESS: loaded {model_type_str}")
 
-        # Determine base path based on environment
-        # Docker container: files copied to /app
-        # Local dev: files in project root
-        if os.path.exists('/app/mlruns'):
-            base_path = '/app'
-        else:
-            base_path = '.'
+    except Exception as strategy1_error:
+        logger.warning(f"Strategy 1 failed: {strategy1_error}")
 
-        # Load directly from artifact file
-        # Bypasses MLflow registry path resolution which stores
-        # absolute Mac paths in mlflow.db — those paths don't
-        # exist inside the container.
-        # Production equivalent: Azure ML registry resolves
-        # this natively without any path issues.
-        model_path = (
-            f"{base_path}/mlruns/1/models/"
-            f"m-91451c74fbf942d992381ec5b9eda578/"
-            f"artifacts/model.pkl"
-        )
+        # ── Strategy 2: best_model_info.json ──────────────
+        try:
+            import joblib
+            json_path = os.path.join(base_path, "best_model_info.json")
+            logger.info(f"Strategy 2: trying JSON pointer ({json_path})")
 
-        logger.info(f"Loading model from: {model_path}")
-        model = joblib.load(model_path)
-        logger.info(f"Model loaded successfully: {type(model).__name__}")
+            if not os.path.exists(json_path):
+                raise FileNotFoundError(f"best_model_info.json not found at {json_path}")
 
-        feature_columns = [
-            'CreditScore', 'Gender', 'Age', 'Tenure', 'Balance',
-            'NumOfProducts', 'HasCrCard', 'IsActiveMember',
-            'EstimatedSalary', 'Geography_France', 'Geography_Germany',
-            'Geography_Spain', 'Balance_to_Salary_ratio',
-            'Products_per_Year', 'Is_Zero_Balance',
-            'Age_Group', 'Engagement_Score'
-        ]
+            with open(json_path, "r") as f:
+                model_info = json.load(f)
 
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
+            # pkl_path in JSON is relative — prepend base_path
+            relative_pkl = model_info['pkl_path']
+            # Handle both ./mlruns/... and mlruns/... formats
+            relative_pkl = relative_pkl.lstrip('./')
+            absolute_pkl = os.path.join(base_path, relative_pkl)
+
+            logger.info(f"Strategy 2: loading pkl from {absolute_pkl}")
+
+            if not os.path.exists(absolute_pkl):
+                raise FileNotFoundError(f"pkl not found at {absolute_pkl}")
+
+            loaded_model = joblib.load(absolute_pkl)
+            model_type_str = model_info.get('model_type', type(loaded_model).__name__)
+
+            logger.info(
+                f"Strategy 2 SUCCESS: loaded {model_type_str} "
+                f"(registered v{model_info.get('registered_version', 'unknown')}, "
+                f"AUC={model_info.get('auc_roc', 'unknown')})"
+            )
+
+        except Exception as strategy2_error:
+            logger.warning(f"Strategy 2 failed: {strategy2_error}")
+
+            # ── Strategy 3: File Scan ──────────────────────
+            try:
+                import joblib
+                import glob
+
+                logger.info("Strategy 3: scanning for model pkl files")
+                pattern = os.path.join(base_path, "mlruns/**/model.pkl")
+                all_pkls = glob.glob(pattern, recursive=True)
+
+                if not all_pkls:
+                    raise FileNotFoundError(
+                        f"No model.pkl found under {base_path}/mlruns/"
+                    )
+
+                logger.info(f"Strategy 3: found {len(all_pkls)} pkl files")
+
+                # Try to pick best by MLflow metrics if readable
+                try:
+                    mlflow.set_tracking_uri(tracking_uri)
+                    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+                    experiments = client.search_experiments()
+
+                    best_auc = -1
+                    best_run_id = None
+
+                    for exp in experiments:
+                        runs = client.search_runs(
+                            experiment_ids=[exp.experiment_id],
+                            filter_string="params.gates_passed = 'True'",
+                            order_by=["metrics.auc_roc DESC"],
+                            max_results=1
+                        )
+                        if runs:
+                            run_auc = runs[0].data.metrics.get('auc_roc', 0)
+                            if run_auc > best_auc:
+                                best_auc = run_auc
+                                best_run_id = runs[0].info.run_id
+
+                    if best_run_id:
+                        # Find pkl whose path contains the run id
+                        for pkl_path in all_pkls:
+                            if best_run_id in pkl_path:
+                                loaded_model = joblib.load(pkl_path)
+                                model_type_str = type(loaded_model).__name__
+                                logger.info(
+                                    f"Strategy 3 SUCCESS (metric-ranked): "
+                                    f"{model_type_str} AUC={best_auc:.4f}"
+                                )
+                                break
+
+                except Exception as metric_error:
+                    logger.warning(f"Strategy 3 metric ranking failed: {metric_error}")
+
+                # Final fallback — load first available pkl
+                if loaded_model is None:
+                    loaded_model = joblib.load(all_pkls[0])
+                    model_type_str = type(loaded_model).__name__
+                    logger.warning(
+                        f"Strategy 3 SUCCESS (first available): {model_type_str}"
+                    )
+
+            except Exception as strategy3_error:
+                logger.error(
+                    f"ALL strategies failed. Service will be unhealthy.\n"
+                    f"Strategy 1: {strategy1_error}\n"
+                    f"Strategy 2: {strategy2_error}\n"
+                    f"Strategy 3: {strategy3_error}"
+                )
+                return
+
+    # Assign to global
+    model = loaded_model
+
+    # Feature columns — must match preprocess.py exactly
+    # If these don't match training, predictions will be wrong
+    feature_columns = [
+        'CreditScore', 'Gender', 'Age', 'Tenure', 'Balance',
+        'NumOfProducts', 'HasCrCard', 'IsActiveMember',
+        'EstimatedSalary', 'Geography_France', 'Geography_Germany',
+        'Geography_Spain', 'Balance_to_Salary_ratio',
+        'Products_per_Year', 'Is_Zero_Balance',
+        'Age_Group', 'Engagement_Score'
+    ]
+
+    logger.info(
+        f"Service ready. Model: {model_type_str}. "
+        f"Features: {len(feature_columns)}"
+    )
 
 
 # ── Endpoints ──────────────────────────────────────────────
@@ -272,7 +420,7 @@ async def health_check():
     Called every 10 seconds by Kubernetes.
     Returns 503 if model not loaded — pod gets no traffic
     until model is ready. Correct behaviour — never serve
-    predictions from a pod with no model.
+    predictions from a pod with no model loaded.
     """
     if model is None:
         raise HTTPException(
@@ -282,6 +430,7 @@ async def health_check():
     return {
         "status":       "healthy",
         "model_loaded": True,
+        "model_type":   type(model).__name__,
         "service":      "cme-churn-prediction"
     }
 
@@ -292,10 +441,11 @@ async def predict_churn(customer: CustomerFeatures):
     Main prediction endpoint.
 
     Accepts customer features, returns:
-    - churn_probability: float between 0 and 1
+    - churn_probability: float 0-1
     - risk_tier: HIGH / MEDIUM / LOW
-    - top_reasons: top 3 SHAP-driven risk factors
-    - model_version: which model version produced this prediction
+    - top_reasons: top 3 SHAP-driven risk factors in plain English
+    - model_version: which version produced this prediction
+    - model_type: which algorithm is currently serving
 
     Called by CRM systems, relationship manager dashboards,
     and automated monitoring pipelines.
@@ -310,16 +460,14 @@ async def predict_churn(customer: CustomerFeatures):
         # Convert input to dict
         input_data = customer.model_dump()
 
-        # Apply feature engineering — must match training
+        # Apply feature engineering — must match training exactly
         feature_df = engineer_features_for_input(input_data)
 
-        # Reorder columns to match exact training order
+        # Reorder columns to match training order exactly
         feature_df = feature_df[feature_columns]
 
         # Predict
-        churn_prob = float(
-            model.predict_proba(feature_df)[0][1]
-        )
+        churn_prob = float(model.predict_proba(feature_df)[0][1])
 
         # Risk tier
         risk_tier = get_risk_tier(churn_prob)
@@ -328,15 +476,16 @@ async def predict_churn(customer: CustomerFeatures):
         reasons = get_shap_reasons(model, feature_df)
 
         logger.info(
-            f"Prediction: prob={churn_prob:.3f} "
-            f"tier={risk_tier}"
+            f"Prediction: prob={churn_prob:.3f} tier={risk_tier} "
+            f"model={type(model).__name__}"
         )
 
         return ChurnPrediction(
             churn_probability=round(churn_prob, 4),
             risk_tier=risk_tier,
             top_reasons=reasons,
-            model_version="cme_churn_model_v1"
+            model_version="cme_churn_model_v1",
+            model_type=type(model).__name__
         )
 
     except Exception as e:
