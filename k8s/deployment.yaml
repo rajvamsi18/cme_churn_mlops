@@ -1,0 +1,113 @@
+# k8s/deployment.yaml
+#
+# Defines HOW the application runs in Kubernetes.
+#
+# Key concepts:
+# - replicas: run 2 identical pods for high availability
+#   if one pod crashes, the other keeps serving traffic
+# - rolling update: deploy new version gradually
+#   new pods come up → health checks pass → old pods terminate
+#   zero downtime deployment
+# - resource limits: prevent one pod consuming all node resources
+# - liveness probe: Kubernetes restarts pod if /health fails
+# - readiness probe: Kubernetes only sends traffic when /health passes
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cme-churn-api
+  namespace: default
+  labels:
+    app: cme-churn-api
+    version: v1
+    team: data-science
+spec:
+  # Run 2 replicas for high availability
+  # If one pod crashes, traffic automatically routes to the other
+  # In production this would be 3+ depending on traffic volume
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: cme-churn-api
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Only take down 1 pod at a time during update
+      # Ensures at least 1 pod always serving traffic
+      maxUnavailable: 1
+      # Allow 1 extra pod during update (surge capacity)
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: cme-churn-api
+        version: v1
+    spec:
+      containers:
+        - name: cme-churn-api
+          # Image from GitHub Container Registry
+          # In production: Azure Container Registry (ACR)
+          # Tag uses commit SHA for exact version traceability
+          image: ghcr.io/rajvamsi18/cme_churn_mlops/cme-churn-api:latest
+
+          ports:
+            - containerPort: 8000
+              name: http
+
+          # Environment variables
+          # MLFLOW_TRACKING_URI tells the app where to find
+          # the MLflow database inside the container
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "sqlite:////app/mlflow.db"
+            - name: PYTHONPATH
+              value: "/app"
+
+          # Resource limits — critical in production
+          # Without limits, a memory leak could consume
+          # all node resources and crash other services
+          resources:
+            requests:
+              # Minimum guaranteed resources for this pod
+              memory: "512Mi"
+              cpu: "250m"    # 0.25 CPU cores
+            limits:
+              # Maximum resources pod can consume
+              memory: "1Gi"
+              cpu: "500m"    # 0.5 CPU cores
+
+          # Liveness probe — "is the pod alive?"
+          # If this fails 3 times, Kubernetes RESTARTS the pod
+          # Catches: infinite loops, deadlocks, memory issues
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60  # wait 60s for model to load
+            periodSeconds: 30         # check every 30s
+            failureThreshold: 3       # restart after 3 failures
+
+          # Readiness probe — "is the pod ready for traffic?"
+          # If this fails, Kubernetes STOPS sending traffic to pod
+          # but does NOT restart it
+          # Catches: model not loaded yet, temporary overload
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Startup probe — gives pod time to load model at startup
+          # Prevents liveness probe from killing pod before
+          # model has finished loading (which takes ~5-10 seconds)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 12     # 12 * 10s = 120s to start
+            periodSeconds: 10

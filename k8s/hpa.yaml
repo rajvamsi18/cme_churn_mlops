@@ -1,0 +1,36 @@
+# k8s/hpa.yaml
+# Horizontal Pod Autoscaler
+#
+# Automatically scales the number of pods based on CPU load.
+# When traffic spikes (e.g., end of month churn scoring run),
+# Kubernetes adds more pods. When traffic drops, it removes them.
+# You only pay for what you use.
+#
+# Example:
+# Normal traffic  → 2 pods (minReplicas)
+# Traffic spike   → scales up to 10 pods (maxReplicas)
+# Traffic drops   → scales back down to 2 pods
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cme-churn-api-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cme-churn-api
+
+  minReplicas: 2    # always run at least 2 for availability
+  maxReplicas: 10   # never exceed 10 (cost control)
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Scale up when average CPU across all pods > 70%
+          # Scale down when it drops back below 70%
+          averageUtilization: 70
