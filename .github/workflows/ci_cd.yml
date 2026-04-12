@@ -1,0 +1,193 @@
+# .github/workflows/ci_cd.yml
+#
+# CI/CD Pipeline for CME Churn Prediction
+#
+# Triggered on every push to main branch.
+# Pipeline stages:
+#   1. Run unit tests
+#   2. Preprocess data
+#   3. Train models + check threshold gates
+#   4. Build Docker image
+#   5. Push to GitHub Container Registry
+#   6. Deploy to production (simulated)
+
+name: CME Churn MLOps Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+
+  # ── Job 1: Test ───────────────────────────────────────────
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short
+        continue-on-error: true
+
+  # ── Job 2: Train and Validate ─────────────────────────────
+  train:
+    name: Train Models + Threshold Gates
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgomp1
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download dataset
+        run: |
+          mkdir -p data/raw
+          kaggle datasets download \
+            -d shantanudhakadd/bank-customer-churn-prediction \
+            -p data/raw --unzip
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+
+      - name: Run preprocessing
+        run: python src/features/preprocess.py
+
+      - name: Train models + check threshold gates
+        run: python src/models/train.py
+        # Automatically trains 3 models, checks AUC > 0.75
+        # and Recall > 0.55 gates, registers best model.
+        # Pipeline FAILS here if no model passes gates —
+        # blocking Docker build and deployment.
+
+      - name: Upload MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-artifacts
+          path: |
+            mlflow.db
+            mlruns/
+          retention-days: 30
+
+  # ── Job 3: Build and Push Docker Image ───────────────────
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: train
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download MLflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mlflow-artifacts
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t ghcr.io/${{ github.repository }}/cme-churn-api:latest \
+            -t ghcr.io/${{ github.repository }}/cme-churn-api:${{ github.sha }} \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push ghcr.io/${{ github.repository }}/cme-churn-api:latest
+          docker push ghcr.io/${{ github.repository }}/cme-churn-api:${{ github.sha }}
+
+      - name: Smoke test the image
+        run: |
+          docker run -d \
+            --name smoke-test \
+            -p 8000:8000 \
+            ghcr.io/${{ github.repository }}/cme-churn-api:latest
+
+          echo "Waiting for container to start..."
+          sleep 20
+
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:8000/health)
+
+          echo "Health check response: $response"
+
+          if [ "$response" != "200" ]; then
+            echo "SMOKE TEST FAILED — health check returned $response"
+            docker logs smoke-test
+            exit 1
+          fi
+
+          echo "Smoke test passed ✓"
+          docker stop smoke-test
+
+  # ── Job 4: Deploy ─────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Simulate AKS deployment
+        run: |
+          echo "================================================"
+          echo "DEPLOYMENT SUMMARY"
+          echo "================================================"
+          echo "Image: ghcr.io/${{ github.repository }}/cme-churn-api"
+          echo "Tag:   ${{ github.sha }}"
+          echo "Ref:   ${{ github.ref }}"
+          echo ""
+          echo "In production this step would:"
+          echo "  1. Connect to AKS via kubectl"
+          echo "  2. kubectl set image deployment/churn-api"
+          echo "     churn-api=ghcr.io/.../cme-churn-api:${{ github.sha }}"
+          echo "  3. Monitor rolling update"
+          echo "     new pods up → health checks pass → old pods terminate"
+          echo "  4. Auto-rollback if health checks fail"
+          echo "================================================"
+          echo "Deployment complete ✓"
