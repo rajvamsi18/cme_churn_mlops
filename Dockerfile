@@ -24,6 +24,7 @@ COPY src/ ./src/
 # mlruns/ contains the actual model files saved during training
 COPY mlflow.db .
 COPY mlruns/ ./mlruns/
+COPY best_model_info.json .
 
 # Environment variables
 # Tells MLflow exactly where to find its database inside the container
