@@ -152,6 +152,7 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
             if hasattr(model_obj, 'named_steps')
             else model_obj
         )
+
         explainer = shap.TreeExplainer(underlying)
 
         if hasattr(model_obj, 'named_steps'):
@@ -160,10 +161,22 @@ def get_shap_reasons(model_obj, feature_df: pd.DataFrame) -> list:
         else:
             shap_values = explainer.shap_values(feature_df)
 
+        # Handle all possible SHAP output shapes for RandomForest
+        shap_array = np.array(shap_values)
+
         if isinstance(shap_values, list):
-            shap_vals = shap_values[1][0]
+            # Old format: list of arrays, one per class
+            # Take class 1 (churn), first sample
+            shap_vals = np.array(shap_values[1])[0]
+        elif shap_array.ndim == 3:
+            # New format: (n_samples, n_features, n_classes)
+            # Shape (1, 17, 2) — take first sample, class 1
+            shap_vals = shap_array[0, :, 1]
+        elif shap_array.ndim == 2:
+            # Shape (n_samples, n_features) — binary output
+            shap_vals = shap_array[0]
         else:
-            shap_vals = shap_values[0]
+            shap_vals = shap_array
 
         feature_names = feature_df.columns.tolist()
         shap_dict = dict(zip(feature_names, shap_vals))
