@@ -1,0 +1,57 @@
+{
+  "report_timestamp": "2026-04-12T17:56:50.523177",
+  "model_name": "cme_churn_model",
+  "layer_1_drift": {
+    "Age": {
+      "psi": 0.0828,
+      "status": "STABLE"
+    },
+    "Engagement_Score": {
+      "psi": 0.001,
+      "status": "STABLE"
+    },
+    "Age_Group": {
+      "psi": 0.1422,
+      "status": "MONITOR"
+    },
+    "NumOfProducts": {
+      "psi": 0.0,
+      "status": "STABLE"
+    },
+    "IsActiveMember": {
+      "psi": 0.0,
+      "status": "STABLE"
+    },
+    "Gender": {
+      "psi": 0.0,
+      "status": "STABLE"
+    },
+    "Balance": {
+      "psi": 0.2145,
+      "status": "ALERT"
+    },
+    "_summary": {
+      "timestamp": "2026-04-12T17:56:50.475741",
+      "features_monitored": 6,
+      "alerts": [
+        "Balance"
+      ],
+      "alert_count": 1,
+      "recommendation": "monitor"
+    }
+  },
+  "layer_2_quality": {
+    "timestamp": "2026-04-12T17:56:50.523061",
+    "n_evaluated": 5000,
+    "baseline_recall": 0.3872,
+    "current_recall": 0.3935,
+    "degradation": -0.0063,
+    "auc_roc": 0.8702,
+    "status": "STABLE",
+    "recommendation": "continue_monitoring",
+    "threshold_used": 0.05
+  },
+  "overall_status": "MONITOR",
+  "action_required": false,
+  "recommended_action": "increase_monitoring_frequency"
+}

@@ -51,7 +51,9 @@ spec:
           # Image from GitHub Container Registry
           # In production: Azure Container Registry (ACR)
           # Tag uses commit SHA for exact version traceability
-          image: ghcr.io/rajvamsi18/cme_churn_mlops/cme-churn-api:latest
+          #image: ghcr.io/rajvamsi18/cme_churn_mlops/cme-churn-api:latest
+          image: cme-churn-api:v1
+          imagePullPolicy: Never
 
           ports:
             - containerPort: 8000
